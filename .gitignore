@@ -5,8 +5,12 @@ __pycache__/
 .venv/
 venv/
 
-# Data / prepared files
-data/
+# Data folder: keep code + stats JSON, ignore heavy arrays/prepared data
+data/*
+!data/
+!data/**/*.py
+!data/**/*.json
+
 *.npz
 *.npy
 
