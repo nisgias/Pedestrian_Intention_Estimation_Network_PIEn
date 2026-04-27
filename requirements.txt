@@ -1,0 +1,12 @@
+numpy==1.26.4
+scipy==1.13.0
+opencv-python==4.9.0.80
+Pillow==10.3.0
+scikit-learn==1.4.2
+pandas==2.2.2
+tqdm==4.66.4
+pyyaml==6.0.1
+tensorboard==2.16.2
+matplotlib==3.8.4
+seaborn==0.13.2
+einops==0.7.0

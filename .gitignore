@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Data / prepared files
+data/
+*.npz
+*.npy
+
+# Checkpoints / model weights
+checkpoints*/
+*.pth
+*.pt
+*.ckpt
+
+# Logs
+*.log
+nohup.out
+
+# Caches / generated visual outputs
+m2f_cache*/
+manydepth/
+raft_cache*/
+visualizations/
+runs/
+outputs/
+
+# OS / editor
+.DS_Store
+.vscode/

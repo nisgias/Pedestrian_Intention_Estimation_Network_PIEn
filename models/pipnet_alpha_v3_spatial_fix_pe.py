@@ -1,0 +1,451 @@
+# models/pipnet_alpha_v3_spatial_fix_pe.py
+"""
+PIPNet-Alpha V3 — SPATIAL FIX + POSITIONAL ENCODING
+
+Same as pipnet_alpha_v3_spatial_fix.py with ONE addition:
+  Learnable positional embedding on the 160 spatial-temporal tokens.
+
+WHY:
+  When we flatten [B, T, 4, 4, 256] → [B, 160, 256], cross-attention
+  sees 160 unordered vectors. It cannot distinguish:
+    - Token 0 = frame 1, top-left
+    - Token 16 = frame 2, top-left
+    - Token 15 = frame 1, bottom-right
+  
+  Positional encoding tells each token WHERE and WHEN it is.
+  Now cross-attention can query: "is there a crosswalk AHEAD (spatial)
+  in the RECENT frames (temporal)?"
+
+CHANGES from spatial_fix.py:
+  1. Added: self.pos_embed = nn.Parameter(...)  in GlobalContextBranchSpatial.__init__
+  2. Added: combined = combined + self.pos_embed  in GlobalContextBranchSpatial.forward
+  
+  Everything else IDENTICAL.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+# ============================================================
+# ATTENTION MODULES (UNCHANGED)
+# ============================================================
+
+class PIPNetAttention(nn.Module):
+    """Luong-style temporal attention with diagonal Wc initialization."""
+    def __init__(self, hidden_dim: int, out_dim: int, dropout_p: float = 0.5):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        
+        self.Wp = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.Wc = nn.Linear(hidden_dim * 2, out_dim)
+        self.dropout = nn.Dropout(dropout_p)
+        
+        self._init_diagonal()
+    
+    def _init_diagonal(self):
+        with torch.no_grad():
+            out_dim, in_dim = self.Wc.weight.shape
+            half_in = in_dim // 2
+            
+            self.Wc.weight.fill_(0.0)
+            scale = 1.0 / math.sqrt(in_dim)
+            
+            for i in range(min(out_dim, half_in)):
+                self.Wc.weight[i, i] = scale
+                self.Wc.weight[i, half_in + i] = scale
+            
+            if out_dim > half_in:
+                for i in range(half_in, out_dim):
+                    j = i % half_in
+                    self.Wc.weight[i, j] = scale * 0.5
+                    self.Wc.weight[i, half_in + j] = scale * 0.5
+            
+            if self.Wc.bias is not None:
+                self.Wc.bias.fill_(0.0)
+    
+    def forward(self, h: torch.Tensor, use_mean_query: bool = False):
+        if use_mean_query:
+            hm = h.mean(dim=1)
+        else:
+            hm = h[:, -1, :]
+        
+        h_proj = self.Wp(h)
+        scores = torch.bmm(h_proj, hm.unsqueeze(-1)).squeeze(-1)
+        alpha = F.softmax(scores, dim=-1)
+        hc = torch.bmm(alpha.unsqueeze(1), h).squeeze(1)
+        concat = torch.cat([hc, hm], dim=-1)
+        out = torch.tanh(self.Wc(concat))
+        out = self.dropout(out)
+        return out, alpha
+
+
+class CrossAttention(nn.Module):
+    """Cross-Attention: Query from one modality attends over another."""
+    def __init__(self, query_dim: int, key_dim: int, out_dim: int, dropout_p: float = 0.5):
+        super().__init__()
+        self.scale = query_dim ** -0.5
+        
+        self.W_q = nn.Linear(query_dim, query_dim)
+        self.W_k = nn.Linear(key_dim, query_dim)
+        self.W_v = nn.Linear(key_dim, query_dim)
+        
+        self.W_o = nn.Linear(query_dim, out_dim)
+        self.dropout = nn.Dropout(dropout_p)
+        self.norm = nn.LayerNorm(out_dim)
+    
+    def forward(self, query: torch.Tensor, context: torch.Tensor):
+        Q = self.W_q(query)
+        K = self.W_k(context)
+        V = self.W_v(context)
+        
+        scores = torch.bmm(Q.unsqueeze(1), K.transpose(-1, -2)).squeeze(1)
+        scores = scores * self.scale
+        
+        alpha = F.softmax(scores, dim=-1)
+        alpha = self.dropout(alpha)
+        
+        attended = torch.bmm(alpha.unsqueeze(1), V).squeeze(1)
+        
+        out = self.W_o(attended)
+        out = self.norm(out)
+        
+        return out, alpha
+
+
+# ============================================================
+# BRANCH MODULES (UNCHANGED)
+# ============================================================
+
+class KinematicBranch(nn.Module):
+    def __init__(self, bbox_dim=4, pose_dim=34, speed_dim=1, hidden_dim=128):
+        super().__init__()
+        self.pose_gru = nn.GRU(pose_dim, 64, batch_first=True)
+        self.pose_bbox_gru = nn.GRU(64 + bbox_dim, 128, batch_first=True)
+        self.full_gru = nn.GRU(128 + speed_dim, hidden_dim, batch_first=True)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, bbox, pose, speed):
+        h_pose, _ = self.pose_gru(pose)
+        h_pb = torch.cat([h_pose, bbox], dim=-1)
+        h_pb, _ = self.pose_bbox_gru(h_pb)
+        h_full = torch.cat([h_pb, speed], dim=-1)
+        h_out, _ = self.full_gru(h_full)
+        return self.norm(h_out)
+
+
+class LocalVisualBranch(nn.Module):
+    def __init__(self, cnn_dim=512, hidden_dim=256):
+        super().__init__()
+        self.content_pool = nn.AdaptiveMaxPool2d((1, 1))
+        self.content_fc = nn.Linear(cnn_dim, 128)
+        self.content_norm = nn.LayerNorm(128)
+        
+        self.motion_conv = nn.Sequential(
+            nn.Conv2d(2, 32, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.motion_proj = nn.Linear(64, 128)
+        self.motion_norm = nn.LayerNorm(128)
+        
+        self.content_gru = nn.GRU(128, 128, batch_first=True)
+        self.motion_gru = nn.GRU(128, 128, batch_first=True)
+        self.fuse_gru = nn.GRU(256, hidden_dim, batch_first=True)
+        self.out_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, local_cnn, local_motion):
+        B, T = local_cnn.shape[:2]
+        
+        if local_cnn.dim() == 5:
+            cnn_flat = local_cnn.view(B * T, *local_cnn.shape[2:])
+            cnn_pooled = self.content_pool(cnn_flat).view(B * T, -1)
+            cnn_feat = self.content_fc(cnn_pooled).view(B, T, -1)
+        else:
+            cnn_feat = self.content_fc(local_cnn)
+        cnn_feat = self.content_norm(cnn_feat)
+        h_content, _ = self.content_gru(cnn_feat)
+        
+        if local_motion.dim() == 5:
+            motion_flat = local_motion.view(B * T, *local_motion.shape[2:])
+            motion_feat = self.motion_conv(motion_flat)
+            motion_feat = motion_feat.view(B * T, -1)
+            motion_feat = self.motion_proj(motion_feat).view(B, T, -1)
+        else:
+            if local_motion.shape[-1] != 128:
+                motion_feat = F.adaptive_avg_pool1d(
+                    local_motion.transpose(1, 2), 128
+                ).transpose(1, 2)
+            else:
+                motion_feat = local_motion
+        motion_feat = self.motion_norm(motion_feat)
+        h_motion, _ = self.motion_gru(motion_feat)
+        
+        h_cat = torch.cat([h_content, h_motion], dim=-1)
+        h_local, _ = self.fuse_gru(h_cat)
+        h_local = self.out_norm(h_local)
+        
+        return h_local
+
+
+# ============================================================
+# ★ GLOBAL BRANCH — SPATIAL + POSITIONAL ENCODING ★
+# ============================================================
+
+class GlobalContextBranchSpatialPE(nn.Module):
+    """
+    Same as GlobalContextBranchSpatial + learnable positional encoding.
+    
+    Without PE: 160 tokens are an unordered bag. Cross-attention cannot
+    distinguish "top-left in frame 1" from "bottom-right in frame 5".
+    
+    With PE: each token knows its (time, row, col) position.
+    Cross-attention can now query: "what's AHEAD of the pedestrian
+    in the MOST RECENT frames?"
+    
+    Only 2 lines added:
+      __init__:  self.pos_embed = nn.Parameter(...)
+      forward:   combined = combined + self.pos_embed[...]
+    
+    Extra parameters: 160 × 256 = 40,960 (negligible, ~1% of model)
+    """
+    def __init__(self, sem_num_classes=20, sem_embed_dim=16, hidden_dim=256,
+                 max_T=20, spatial_size=16):
+        super().__init__()
+        
+        self.sem_embed = nn.Embedding(sem_num_classes, sem_embed_dim)
+        
+        self.sem_conv = nn.Sequential(
+            nn.Conv2d(sem_embed_dim, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+        )
+        
+        self.depth_conv = nn.Sequential(
+            nn.Conv2d(2, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+        )
+        
+        # Force output to exactly 4×4 regardless of input resolution
+        # (sem_labels can be 64×64, 384×672, or any size)
+        self.combine_conv = nn.Sequential(
+            nn.Conv2d(512, 256, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            nn.AdaptiveMaxPool2d((4, 4)),   # ← preserves small features
+            nn.Conv2d(256, hidden_dim, kernel_size=1),
+            nn.BatchNorm2d(hidden_dim), nn.ReLU(inplace=True),
+        )
+        
+        self.spatial_norm = nn.LayerNorm(hidden_dim)
+        
+        # ★ NEW: Learnable positional encoding ★
+        # max_T * spatial_size = e.g. 20 * 16 = 320 (supports up to T=20)
+        # Initialized small (0.02 std) so it doesn't dominate features early
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, max_T * spatial_size, hidden_dim) * 0.02
+        )
+    
+    def forward(self, sem_labels, cat_depth):
+        B, T = sem_labels.shape[:2]
+        
+        # Semantic
+        sem_clamped = sem_labels.clamp(0, self.sem_embed.num_embeddings - 1)
+        sem_emb = self.sem_embed(sem_clamped)
+        sem_emb = sem_emb.view(B * T, *sem_emb.shape[2:])
+        sem_emb = sem_emb.permute(0, 3, 1, 2).contiguous()
+        sem_feat = self.sem_conv(sem_emb)
+        
+        # Depth
+        if cat_depth.dtype != torch.float32:
+            cat_depth = cat_depth.float()
+        depth_flat = cat_depth.view(B * T, *cat_depth.shape[2:])
+        depth_feat = self.depth_conv(depth_flat)
+        
+        # Combine: 8×8 → 4×4
+        combined = torch.cat([sem_feat, depth_feat], dim=1)
+        combined = self.combine_conv(combined)
+        
+        # Flatten spatial → tokens
+        S = combined.shape[2] * combined.shape[3]  # 16
+        combined = combined.flatten(2).transpose(1, 2)  # [B*T, 16, 256]
+        combined = self.spatial_norm(combined)
+        combined = combined.reshape(B, T * S, -1)  # [B, T*16, 256]
+        
+        # ★ NEW: Add positional encoding ★
+        # Slice to actual sequence length (handles variable T)
+        combined = combined + self.pos_embed[:, :combined.shape[1], :]
+        
+        return combined
+
+
+# ============================================================
+# MAIN MODEL
+# ============================================================
+
+class PIPNetAlphaV3SpatialFixPE(nn.Module):
+    """
+    Spatial Fix + Positional Encoding.
+    
+    Same as PIPNetAlphaV3SpatialFix but global tokens now know
+    their spatiotemporal position.
+    
+    Only change: GlobalContextBranchSpatial → GlobalContextBranchSpatialPE
+    """
+    def __init__(
+        self,
+        bbox_dim: int = 4,
+        pose_dim: int = 34,
+        speed_dim: int = 1,
+        branch_out_dim: int = 128,
+        final_dim: int = 256,
+        sem_num_classes: int = 20,
+        sem_embed_dim: int = 16,
+        dropout_p: float = 0.5,
+    ):
+        super().__init__()
+        
+        self.branch_out_dim = branch_out_dim
+        self.final_dim = final_dim
+        
+        # ============ KINEMATIC BRANCH ============
+        self.kinematic_branch = KinematicBranch(
+            bbox_dim=bbox_dim, pose_dim=pose_dim,
+            speed_dim=speed_dim, hidden_dim=128
+        )
+        self.kin_attn = PIPNetAttention(128, branch_out_dim, dropout_p)
+        self.norm_kin = nn.LayerNorm(branch_out_dim)
+        
+        # ============ LOCAL VISUAL BRANCH ============
+        self.local_branch = LocalVisualBranch(cnn_dim=512, hidden_dim=256)
+        self.local_attn = PIPNetAttention(256, branch_out_dim, dropout_p)
+        self.norm_local = nn.LayerNorm(branch_out_dim)
+        
+        # ============ ★ GLOBAL BRANCH WITH PE ★ ============
+        self.global_branch = GlobalContextBranchSpatialPE(
+            sem_num_classes=sem_num_classes,
+            sem_embed_dim=sem_embed_dim,
+            hidden_dim=256,
+            max_T=20,        # supports seq_len up to 20
+            spatial_size=16,  # 4×4 grid
+        )
+        
+        # ============ CROSS-ATTENTION ============
+        self.cross_attn = CrossAttention(
+            query_dim=branch_out_dim,
+            key_dim=256,
+            out_dim=branch_out_dim,
+            dropout_p=dropout_p
+        )
+        
+        # ============ VISUAL FUSION: RESIDUAL ============
+        self.norm_visual = nn.LayerNorm(branch_out_dim)
+        
+        # ============ FINAL ATTENTION ============
+        self.final_attn = PIPNetAttention(branch_out_dim, final_dim, dropout_p)
+        
+        # ============ AUXILIARY HEADS ============
+        self.aux_kin = nn.Linear(branch_out_dim, 1)
+        self.aux_local = nn.Linear(branch_out_dim, 1)
+        self.aux_global = nn.Linear(branch_out_dim, 1)
+        
+        # ============ OUTPUT ============
+        self.fc_out = nn.Linear(final_dim, 1)
+
+    def forward(self, batch: dict, return_aux: bool = False):
+        bbox = batch["bbox"]
+        pose = batch["pose"]
+        speed = batch["speed"]
+        local_cnn = batch["local_cnn"]
+        local_motion = batch["local_motion"]
+        sem_labels = batch["sem_labels"]
+        cat_depth = batch["cat_depth"]
+        
+        B = bbox.size(0)
+        
+        # 1. KINEMATIC
+        h_kin = self.kinematic_branch(bbox, pose, speed)
+        z_kin, alpha_kin = self.kin_attn(h_kin)
+        z_kin = self.norm_kin(z_kin)
+        
+        # 2. LOCAL VISUAL
+        h_local = self.local_branch(local_cnn, local_motion)
+        z_local, alpha_local = self.local_attn(h_local)
+        z_local = self.norm_local(z_local)
+        
+        # 3. GLOBAL (spatial tokens + positional encoding)
+        h_global = self.global_branch(sem_labels, cat_depth)
+        
+        # 4. CROSS-ATTENTION
+        z_cross, alpha_cross = self.cross_attn(z_local, h_global)
+        
+        # 5. RESIDUAL FUSION
+        z_visual = self.norm_visual(z_local + z_cross)
+        
+        # 6. FINAL ATTENTION
+        z_visual_kin = torch.stack([z_visual, z_kin], dim=1)
+        z_final, alpha_final = self.final_attn(z_visual_kin, use_mean_query=True)
+        
+        # 7. OUTPUT
+        logit = self.fc_out(z_final)
+        
+        if return_aux:
+            return {
+                'logit': logit,
+                'aux_kin': self.aux_kin(z_kin),
+                'aux_local': self.aux_local(z_local),
+                'aux_global': self.aux_global(z_cross),
+                'modality_weights': alpha_final,
+                'cross_attn_weights': alpha_cross,
+                'z_kin': z_kin,
+                'z_local': z_local,
+                'z_cross': z_cross,
+                'z_visual': z_visual,
+            }
+        
+        return logit
+
+
+# ============================================================
+# TEST
+# ============================================================
+
+if __name__ == "__main__":
+    model = PIPNetAlphaV3SpatialFixPE()
+    n_params = sum(p.numel() for p in model.parameters())
+    
+    # Count PE params specifically
+    pe_params = model.global_branch.pos_embed.numel()
+    
+    print(f"Spatial Fix + Positional Encoding")
+    print(f"Total parameters: {n_params:,}")
+    print(f"PE parameters:    {pe_params:,} ({pe_params/n_params*100:.1f}% of model)")
+    
+    B, T = 2, 10
+    batch = {
+        "bbox": torch.randn(B, T, 4),
+        "pose": torch.randn(B, T, 34),
+        "speed": torch.randn(B, T, 1),
+        "local_cnn": torch.randn(B, T, 512, 7, 7),
+        "local_motion": torch.randn(B, T, 2, 224, 224),
+        "sem_labels": torch.randint(0, 20, (B, T, 64, 64)),
+        "cat_depth": torch.randn(B, T, 2, 64, 64),
+    }
+    
+    out = model(batch, return_aux=True)
+    print(f"\nOutputs:")
+    print(f"  logit: {out['logit'].shape}")
+    print(f"  cross_attn_weights: {out['cross_attn_weights'].shape}")
+    print(f"  → {out['cross_attn_weights'].shape[1]} tokens, now with positional info!")
+    print(f"\n✓ Each token knows its (time, row, col) position!")

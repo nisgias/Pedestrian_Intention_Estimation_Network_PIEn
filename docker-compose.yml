@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  pie:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pie-intention:latest
+    container_name: pie_dev
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+
+    volumes:
+      - /home/ioann/pie_intention:/workspace/project
+      - /home/ioann/data/PIE:/data/PIE
+      - /home/ioann/data/pie_interface:/data/pie_interface
+      - /home/ioann/data/PIE_PREP_OUT:/data/PIE_PREP_OUT
+      - /home/ioann/data/m2f_cache:/workspace/project/m2f_cache
+      - /home/ioann/data/models:/workspace/models
+      - /home/ioann/data/checkpoints:/workspace/checkpoints
+      - /home/ioann/data/JAAD:/data/JAAD
+      - /home/ioann/data/jaad_interface:/data/jaad_interface
+      - /home/ioann/data/JAAD_PREP_OUT:/data/JAAD_PREP_OUT
+      - /home/ioann/data/TITAN:/data/TITAN
+      - /home/ioann/data/TITAN_PREP_OUT:/data/TITAN_PREP_OUT
+     
+
+    shm_size: "24gb"
+    stdin_open: true
+    tty: true
+    working_dir: /workspace/project
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTHONPATH=/workspace/project:/data/pie_interface
