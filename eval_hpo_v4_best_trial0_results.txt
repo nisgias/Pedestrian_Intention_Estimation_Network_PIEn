@@ -1,0 +1,144 @@
+============================================================
+PIPNet Alpha V4 evaluation
+============================================================
+Project root:    /workspace/project
+Device:          cuda
+AMP:             True
+PIE root:        /Datasets/PIE_PREP_OUT
+Checkpoint:      /workspace/project/hpo_runs/hpo_v4_run1/best_trial/best_model.pth
+Threshold step:  0.01
+============================================================
+
+Loaded checkpoint: /workspace/project/hpo_runs/hpo_v4_run1/best_trial/best_model.pth
+  Best epoch: 7  |  Val AUC at save: ?
+
+Running inference: ablate_global=False
+
+============================================================
+Individual branch AUCs
+============================================================
+    main | val=0.8856 | test=0.8791
+     kin | val=0.8170 | test=0.8653
+   local | val=0.7382 | test=0.7628
+  global | val=0.7654 | test=0.8120
+
+Running validation-based F1 threshold tuning...
+
+============================================================
+F1 threshold tuning — main
+============================================================
+Default threshold = 0.50
+  VAL  | f1=0.6419  prec=0.5337  rec=0.8051  acc=0.8399
+  TEST | f1=0.6764  prec=0.5781  rec=0.8148  acc=0.7934
+
+Best threshold selected on VAL = 0.52
+  VAL  | f1=0.6507  prec=0.5460  rec=0.8051  acc=0.8459
+  TEST | f1=0.6803  prec=0.5849  rec=0.8129  acc=0.7975
+
+============================================================
+F1 threshold tuning — kin
+============================================================
+Default threshold = 0.50
+  VAL  | f1=0.5407  prec=0.4392  rec=0.7034  acc=0.7870
+  TEST | f1=0.6537  prec=0.5195  rec=0.8811  acc=0.7526
+
+Best threshold selected on VAL = 0.66
+  VAL  | f1=0.5772  prec=0.5547  rec=0.6017  acc=0.8429
+  TEST | f1=0.6812  prec=0.5991  rec=0.7895  acc=0.8042
+
+============================================================
+F1 threshold tuning — local
+============================================================
+Default threshold = 0.50
+  VAL  | f1=0.4226  prec=0.2976  rec=0.7288  acc=0.6450
+  TEST | f1=0.5480  prec=0.4133  rec=0.8129  acc=0.6446
+
+Best threshold selected on VAL = 0.52
+  VAL  | f1=0.4308  prec=0.3088  rec=0.7119  acc=0.6647
+  TEST | f1=0.5502  prec=0.4190  rec=0.8012  acc=0.6529
+
+============================================================
+F1 threshold tuning — global
+============================================================
+Default threshold = 0.50
+  VAL  | f1=0.4222  prec=0.3140  rec=0.6441  acc=0.6858
+  TEST | f1=0.5817  prec=0.4660  rec=0.7739  acc=0.7051
+
+Best threshold selected on VAL = 0.76
+  VAL  | f1=0.4790  prec=0.4750  rec=0.4831  acc=0.8127
+  TEST | f1=0.6004  prec=0.6126  rec=0.5887  acc=0.7924
+
+Running grid search with step=0.05...
+
+============================================================
+Best val-tuned post-hoc logit fusion
+============================================================
+  weights  = {'main': np.float64(0.75), 'kin': np.float64(0.25), 'local': np.float64(0.0), 'global': np.float64(0.0)}
+  val AUC  = 0.8924
+  test AUC = 0.8881
+
+  Main-only test AUC: 0.8791
+  Fusion test AUC:    0.8881
+
+============================================================
+F1 threshold tuning — post_hoc_fusion
+============================================================
+Default threshold = 0.50
+  VAL  | f1=0.6263  prec=0.5399  rec=0.7458  acc=0.8414
+  TEST | f1=0.6812  prec=0.5802  rec=0.8246  acc=0.7955
+
+Best threshold selected on VAL = 0.42
+  VAL  | f1=0.6410  prec=0.5155  rec=0.8475  acc=0.8308
+  TEST | f1=0.6752  prec=0.5512  rec=0.8713  acc=0.7779
+  ✓ Post-hoc fusion adds +0.0090 over main alone
+
+Running error correlation analysis on test set...
+
+============================================================
+Method 3 — Branch error correlation
+============================================================
+Interpretation:
+  r < 0.30     → complementary
+  r 0.30–0.60  → partial overlap
+  r > 0.60     → redundant
+============================================================
+
+Individual error rates:
+    main: 0.207  (400 wrong / 1936 total)
+     kin: 0.247  (479 wrong / 1936 total)
+   local: 0.355  (688 wrong / 1936 total)
+  global: 0.295  (571 wrong / 1936 total)
+
+Pairwise error correlation:
+              main       kin     local    global
+------------------------------------------------
+    main     1.000   0.399     0.506     0.302  
+     kin   0.399       1.000   0.367     0.117 ✓
+   local   0.506     0.367       1.000   0.064 ✓
+  global   0.302     0.117 ✓   0.064 ✓     1.000
+
+Global branch complementarity summary:
+  global vs  main: r=0.302  → PARTIAL — some unique signal vs main
+  global vs   kin: r=0.117  → COMPLEMENTARY — global adds unique signal vs kin
+  global vs local: r=0.064  → COMPLEMENTARY — global adds unique signal vs local
+
+============================================================
+Method 1 — Global branch ablation
+(V4: h_global zeroed before visual fusion)
+============================================================
+
+With global branch:
+  main  val=0.8856  test=0.8791
+
+Without global branch:
+  main  val=0.8197  test=0.8146
+
+Delta: with global - without global
+  val:  +0.0659
+  test: +0.0645
+
+  ✓ Global branch HELPS — removing it hurts test AUC by 0.0645
+
+============================================================
+Done.
+============================================================

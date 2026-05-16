@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-eval_branch_fusion_v4.py
+eval_branch_fusion_v5.py
 
-Evaluation script for PIPNet-Alpha V4.
+Evaluation script for PIPNet-Alpha V4 / V5.
 
 Does:
   1. Individual branch AUCs:
@@ -22,23 +22,6 @@ Does:
 
   6. Pearson error correlation:
        checks if branches make similar or different mistakes
-
-Usage:
-
-    PYTHONPATH=. python eval/eval_branch_fusion_v4.py \
-      --pie_root /data/PIE_PREP_OUT \
-      --ckpt checkpoints_v4_balanced_attn_seed42/stage3_pie_baseline/best_model.pth \
-      --batch_size 10 \
-      --amp
-
-Faster version without grid search:
-
-    PYTHONPATH=. python eval/eval_branch_fusion_v4.py \
-      --pie_root /data/PIE_PREP_OUT \
-      --ckpt checkpoints_v4_balanced_attn_seed42/stage3_pie_baseline/best_model.pth \
-      --batch_size 10 \
-      --amp \
-      --skip_grid
 """
 
 import argparse
@@ -86,10 +69,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from data.pie import PIESeqDataset
 
-try:
-    from models.pipnet_alpha_v4_final import PIPNetAlphaV4Final
-except ImportError:
-    from models.pipnet_alpha_v4_final import PIPNetAlphaV3Final as PIPNetAlphaV4Final
+from models.pipnet_alpha_v5_final import PIPNetAlphaV5Final as PIPNetAlphaV4Final
 
 
 # ============================================================
@@ -142,7 +122,7 @@ def collect(model, loader, device, amp=False, ablate_global=False):
     Run inference and collect logits for all four heads.
 
     ablate_global=True sets model._ablate_global = True.
-    In V4 this zeroes h_global before visual fusion.
+    In V4/V5 this zeroes h_global before visual fusion.
     """
     model.eval()
     model._ablate_global = ablate_global
@@ -505,7 +485,7 @@ def error_correlation(y, z, threshold=0.5):
 def run_ablation(model, val_loader, test_loader, device, amp, y_val, z_val, y_test, z_test):
     print("\n" + "=" * 60)
     print("Method 1 — Global branch ablation")
-    print("(V4: h_global zeroed before visual fusion)")
+    print("(V4/V5: h_global zeroed before visual fusion)")
     print("=" * 60)
 
     y_val_abl, z_val_abl = collect(
@@ -608,7 +588,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("=" * 60)
-    print("PIPNet Alpha V4 evaluation")
+    print("PIPNet Alpha V4/V5 evaluation")
     print("=" * 60)
     print(f"Project root:    {PROJECT_ROOT}")
     print(f"Device:          {device}")
@@ -619,7 +599,15 @@ def main():
     print("=" * 60)
 
     # ── Load model ─────────────────────────────────────────────
-    model = PIPNetAlphaV4Final(dropout_p=0.5).to(device)
+    # UPDATED FOR V5.3 PARAMS
+    model = PIPNetAlphaV4Final(
+        dropout_p=0.4,
+        local_dropout_p=0.1,
+        global_patch_grid=8,
+        global_n_layers=1,
+        global_tf_dropout=0.3,
+        global_stem_dropout=0.3
+    ).to(device)
 
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])

@@ -1,6 +1,7 @@
 import torch
-from models.pipnet_alpha_v3_final import PIPNetAlphaV3Final
-from train_v3_transfer import make_loaders, run_eval_epoch, MultiTaskLoss
+from models.pipnet_alpha_v4_final import PIPNetAlphaV4Final
+from train.train_v4_transfer import make_loaders, run_eval_epoch, MultiTaskLoss
+
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -8,81 +9,110 @@ def main():
     print(" CROSS-DATASET GENERALIZATION TEST (EVAL ON JAAD)")
     print("============================================================")
 
-    # --- ΤΑ ΣΩΣΤΑ ΜΟΝΟΠΑΤΙΑ ΑΠΟ ΤΗΝ ΕΙΚΟΝΑ ΣΟΥ ---
-    jaad_root = "/data/JAAD_PREP_OUT"
-    pie_only_ckpt = "checkpoints_transfer/stage3_pie_baseline/best_model.pth"
-    transfer_ckpt = "checkpoints_transfer/stage2_pie_transfer/best_model.pth"
-    # ---------------------------------------------
+    jaad_root = "/Datasets/JAAD_PREP_OUT"
 
-    # Φόρτωση του JAAD Test Set
+    # PIE-only baseline — seed46 (best single model)
+    pie_only_ckpt = "checkpoints_v4_best_seed46/stage3_pie_baseline/best_model.pth"
+
+    # Transfer model — trial12 (JAAD pretrain -> PIE fine-tune)
+    transfer_ckpt = "checkpoints_reproduce_transfer_trial12/stage2_pie_transfer/best_model.pth"
+
     print("\nLoading JAAD Test Dataset...")
     try:
         _, _, _, jaad_test_loader = make_loaders(
-            jaad_root, "jaad", seq_len=10, batch_size=8, num_workers=4, strict_len=True
+            jaad_root, "jaad", seq_len=10, batch_size=32,
+            num_workers=2, strict_len=True,
         )
         print(f"JAAD Test Sequences: {len(jaad_test_loader.dataset)}")
     except Exception as e:
-        print(f"Σφάλμα κατά τη φόρτωση του JAAD dataset: {e}")
+        print(f"Error loading JAAD dataset: {e}")
         return
 
-    # Loss (To pos_weight δεν επηρεάζει το AUC στο evaluation, βάζουμε 1.0)
     criterion = MultiTaskLoss(pos_weight=1.0)
 
-    # ==========================================================
-    # 1. PIE-Only Baseline Model
-    # ==========================================================
-    print("\n[1/2] Evaluating PIE-Only Model on JAAD Test Set...")
-    model_baseline = PIPNetAlphaV3Final(dropout_p=0.5).to(device)
+    # ------------------------------------------------------------------
+    # 1. PIE-Only Baseline (seed46 params)
+    # ------------------------------------------------------------------
+    print("\n[1/2] Evaluating PIE-Only baseline (seed46) on JAAD Test Set...")
+    model_baseline = PIPNetAlphaV4Final(
+        dropout_p=0.2,
+        local_dropout_p=0.1,
+        global_dropout_p=0.4,
+    ).to(device)
+    baseline_metrics = {}
     try:
-        model_baseline.load_state_dict(torch.load(pie_only_ckpt, map_location=device)['model'])
-        baseline_metrics = run_eval_epoch(model_baseline, jaad_test_loader, device, criterion, use_amp=True)
+        ckpt = torch.load(pie_only_ckpt, map_location=device, weights_only=False)
+        model_baseline.load_state_dict(ckpt["model"])
+        print(f"  Loaded epoch {ckpt.get('epoch','?')} | "
+              f"PIE val AUC at save: {ckpt.get('val_metrics',{}).get('auc','?')}")
+        baseline_metrics = run_eval_epoch(
+            model_baseline, jaad_test_loader, device, criterion, use_amp=True,
+        )
     except Exception as e:
-        print(f"Error loading PIE-Only checkpoint: {e}")
-        baseline_metrics = {}
+        print(f"  Error: {e}")
 
-    # ==========================================================
-    # 2. Transfer Model (JAAD -> PIE)
-    # ==========================================================
-    print("\n[2/2] Evaluating Transfer Model (JAAD->PIE) on JAAD Test Set...")
-    model_transfer = PIPNetAlphaV3Final(dropout_p=0.5).to(device)
+    # ------------------------------------------------------------------
+    # 2. Transfer Model — trial12 (JAAD → PIE)
+    #    dropout_p=0.2, local_dropout_p=0.4, global_dropout_p=0.5
+    #    jaad_lr=1.47e-05, pie_lr=2.08e-05
+    #    aux_weight=0.2, entropy_weight=0.08
+    # ------------------------------------------------------------------
+    print("\n[2/2] Evaluating Transfer model (trial12: JAAD->PIE) on JAAD Test Set...")
+    model_transfer = PIPNetAlphaV4Final(
+        dropout_p=0.2,
+        local_dropout_p=0.4,
+        global_dropout_p=0.5,
+    ).to(device)
+    transfer_metrics = {}
     try:
-        model_transfer.load_state_dict(torch.load(transfer_ckpt, map_location=device)['model'])
-        transfer_metrics = run_eval_epoch(model_transfer, jaad_test_loader, device, criterion, use_amp=True)
+        ckpt = torch.load(transfer_ckpt, map_location=device, weights_only=False)
+        model_transfer.load_state_dict(ckpt["model"])
+        print(f"  Loaded epoch {ckpt.get('epoch','?')} | "
+              f"PIE val AUC at save: {ckpt.get('val_metrics',{}).get('auc','?')}")
+        transfer_metrics = run_eval_epoch(
+            model_transfer, jaad_test_loader, device, criterion, use_amp=True,
+        )
     except Exception as e:
-        print(f"Error loading Transfer checkpoint: {e}")
-        transfer_metrics = {}
+        print(f"  Error: {e}")
 
-    # ==========================================================
-    # FINAL COMPARISON TABLE
-    # ==========================================================
+    # ------------------------------------------------------------------
+    # Results
+    # ------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print(" RESULTS: CROSS-DATASET GENERALIZATION (Tested on JAAD Test Set)")
+    print(" RESULTS: CROSS-DATASET GENERALIZATION (tested on JAAD test set)")
     print("=" * 70)
-    print(f"{'Metric':<18} | {'PIE-Only Model':<20} | {'Transfer (JAAD->PIE)':<20}")
+    print(f"{'Metric':<22} | {'PIE-Only (s46)':>14} | {'Transfer (t12)':>14} | {'Delta':>10}")
     print("-" * 70)
-    
+
     metrics_to_print = [
-        ('auc', 'AUC (Main)'), ('acc', 'Accuracy'), ('f1', 'F1 Score'),
-        ('auc_kin', 'Branch: Kinematic'), ('auc_local', 'Branch: Local'), 
-        ('auc_global', 'Branch: Global')
+        ("auc",        "AUC (main)"),
+        ("acc",        "Accuracy"),
+        ("f1",         "F1 Score"),
+        ("precision",  "Precision"),
+        ("recall",     "Recall"),
+        ("auc_kin",    "Branch: kinematic"),
+        ("auc_local",  "Branch: local"),
+        ("auc_global", "Branch: global"),
     ]
-    
+
     for key, label in metrics_to_print:
-        if key in baseline_metrics and key in transfer_metrics:
-            b_val = baseline_metrics.get(key, float('nan'))
-            t_val = transfer_metrics.get(key, float('nan'))
-            if isinstance(b_val, float) and isinstance(t_val, float):
-                diff = t_val - b_val
-                diff_str = f"({diff:+.4f})"
-                print(f"{label:<18} | {b_val:<20.4f} | {t_val:.4f} {diff_str}")
-            
+        b = baseline_metrics.get(key)
+        t = transfer_metrics.get(key)
+        if b is None or t is None:
+            continue
+        delta = t - b
+        arrow = "+" if delta >= 0 else ""
+        print(f"{label:<22} | {b:>14.4f} | {t:>14.4f} | {arrow}{delta:>+.4f}")
+
     print("=" * 70)
-    print("Interpretation:")
-    print(" - Αν το Transfer (Δεξιά) έχει μεγαλύτερο AUC, το μοντέλο κράτησε")
-    print("   χρήσιμα χαρακτηριστικά από το JAAD (Robustness/Knowledge Retention).")
-    print(" - Αν το PIE-Only (Αριστερά) είναι καλύτερο, το Transfer έπαθε")
-    print("   'Catastrophic Forgetting'.")
-    print("============================================================")
+    print("\nΣημείωση Transfer trial12:")
+    print("  fusion_val_auc = 0.8949")
+    print("  fusion weights: main=0.85, kin=0.15, local=0.00, global=0.00")
+    print("\nΕρμηνεία:")
+    print("  Transfer > PIE-Only -> JAAD pretraining βοήθησε τη γενίκευση")
+    print("  PIE-Only > Transfer -> Catastrophic forgetting κατά PIE fine-tuning")
+    print("=" * 70)
+
 
 if __name__ == "__main__":
     main()

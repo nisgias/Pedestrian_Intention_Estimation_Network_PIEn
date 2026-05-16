@@ -128,15 +128,16 @@ class LocalVisualBranch(nn.Module):
 
         # ── 2. Local Motion Pipeline (Lightweight 3D Upgraded) ─────────
         self.motion_conv3d = nn.Sequential(
-            nn.Conv3d(2, 32, kernel_size=(3, 3, 3), stride=(1, 2, 2), padding=(1, 1, 1)),
-            nn.BatchNorm3d(32), 
+            nn.Conv3d(2, 32, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1)),
+            nn.BatchNorm3d(32),
             nn.ReLU(inplace=True),
-            
-            nn.Conv3d(32, 64, kernel_size=(3, 3, 3), stride=(1, 2, 2), padding=(1, 1, 1)),
-            nn.BatchNorm3d(64), 
+            nn.MaxPool3d(kernel_size=(1, 2, 2)),  # 224 -> 112
+
+            nn.Conv3d(32, 64, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1)),
+            nn.BatchNorm3d(64),
             nn.ReLU(inplace=True),
-            # Note: Spatial pooling is now handled manually in the forward pass
-        )
+            nn.MaxPool3d(kernel_size=(1, 2, 2)),  # 112 -> 56
+            )
         
         self.motion_proj = nn.Linear(64, 128)
         self.motion_norm = nn.LayerNorm(128)
