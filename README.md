@@ -9,6 +9,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Dataset: PIE](https://img.shields.io/badge/Dataset-PIE%20%2F%20JAAD-blue)](https://data.nvision2.eecs.yorku.ca/PIE_dataset/)
 
+<img src="assets/demo.gif" alt="PIPN live crossing-intention demo" width="760">
+
+<em>Live inference on PIE — red = will cross (next ~1–2 s), green = no crossing intent, amber = uncertain.</em>
+
 </div>
 
 ---
@@ -56,21 +60,14 @@ PIPN uses **4.42M parameters — about 20% fewer than PIP-Net-α (≈ 5.5M)** �
 
 ## Architecture
 
-```
-  bbox · pose · ego-speed   ─►  Kinematic Branch   (stacked GRUs)         ─►  z_kin   ─┐
-                                                                                       │
-  VGG19 crop · RAFT flow    ─►  Local Visual Branch (content + motion GRU) ─► z_local ─┤
-                                                                                       ├─►  z_visual ─┐
-  Mask2Former · ManyDepth   ─►  Global Context Branch (Conv3D + GRU)       ─► h_global ┘             │
-                                                                                                     │
-        stage 1 — Visual fusion:  (z_local expanded ⊕ h_global) → attention over T frames → z_visual │
-        stage 2 — Modality fusion: attention over [z_visual, z_kin] → dropout → FC ─────────────────►├─► P(cross)
-```
+<div align="center">
+  <img src="assets/architecture.png" alt="PIPN three-branch architecture" width="880">
+</div>
 
 - **Kinematic branch** — bounding box (4D) + body pose (34D) + ego-speed (1D) through three stacked GRUs and temporal attention pooling → `z_kin` (128D).
 - **Local visual branch** — per-frame **VGG19** crop features (ImageNet-1K) + RAFT optical flow through content and motion GRUs → `z_local` (128D).
 - **Global context branch** — Mask2Former semantic segmentation + ManyDepth instance-aware categorical depth through lightweight Conv3D towers and a temporal GRU → `h_global` (256D).
-- **Fusion** — a two-stage attention scheme (visual fusion, then modality fusion). Three auxiliary heads supervise the branches and enable per-branch analysis.
+- **Fusion** — a two-stage attention scheme: first **visual fusion** (`z_local` ⊕ `h_global` → attention over T frames → `z_visual`), then **modality fusion** (attention over `[z_visual, z_kin]` → dropout → FC → `P(cross)`). Three auxiliary heads supervise the branches and enable per-branch analysis.
 
 ---
 
@@ -79,6 +76,8 @@ PIPN uses **4.42M parameters — about 20% fewer than PIP-Net-α (≈ 5.5M)** �
 ### 1. Install
 
 ```bash
+git clone https://github.com/nisgias/Pedestrian_Intention_Estimation_Network_PIEn.git
+cd Pedestrian_Intention_Estimation_Network_PIEn
 pip install -r requirements.txt          # PyTorch ≥ 2.0, torchvision, transformers, ultralytics, scikit-learn, OpenCV ...
 # or
 docker compose up --build
@@ -155,7 +154,7 @@ python -m eval.eval_roc_horizons          # ROC curves per horizon
 ## Project structure
 
 ```
-pie_intention/
+Pedestrian_Intention_Estimation_Network_PIEn/
 ├── models/
 │   ├── pipnet_alpha_v4_final.py       # PIPN — main model, Conv3D + GRU global branch        (thesis §3.3)
 │   ├── pipnet_alpha_v5_final.py       # Spatial-Patch Transformer variant                    (thesis §3.4.1)
@@ -175,6 +174,7 @@ pie_intention/
 │   ├── jaad/  (prep_kinematics, prep_local, prep_scene)
 │   └── compute_stats.py
 ├── data/                              # dataset loader (pie.py) + per-split normalisation stats
+├── assets/                            # README images (architecture, demo)
 ├── requirements.txt · Dockerfile · docker-compose.yml
 ```
 
@@ -206,7 +206,8 @@ pie_intention/
   school      = {Democritus University of Thrace, Dept. of Electrical and Computer Engineering},
   type        = {Diploma Thesis},
   year        = {2026},
-  note        = {Supervisor: Ilias Theodorakopoulos}
+  note        = {Supervisor: Ilias Theodorakopoulos.
+                 Code: https://github.com/nisgias/Pedestrian_Intention_Estimation_Network_PIEn}
 }
 ```
 
