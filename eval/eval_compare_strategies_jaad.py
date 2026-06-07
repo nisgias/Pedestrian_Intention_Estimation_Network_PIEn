@@ -11,7 +11,7 @@ cross-dataset protocol used in the literature.
 Strategies compared:
     1. PIE-only (S3)       - trained only on PIE
     2. Transfer (S2)       - JAAD pretrain -> PIE fine-tune
-    3. Pooled (S0)         - JAAD + PIE mixed training
+    3. Combine (S0)         - JAAD + PIE mixed training
 
 For each (strategy, split) we report:
     AUC, Static F1 / Acc / Prec / Rec, Tuned F1, per-branch AUCs
@@ -135,7 +135,7 @@ def main():
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--pie_only_ckpt", type=str, default="")
-    ap.add_argument("--pooled_ckpt",   type=str, default="")
+    ap.add_argument("--combine_ckpt",   type=str, default="")
     ap.add_argument("--transfer_ckpt", type=str, default="")
 
     ap.add_argument("--jaad_root", type=str, required=True,
@@ -168,8 +168,8 @@ def main():
         strategies.append(("PIE-only",  args.pie_only_ckpt))
     if args.transfer_ckpt:
         strategies.append(("Transfer",  args.transfer_ckpt))
-    if args.pooled_ckpt:
-        strategies.append(("Pooled",    args.pooled_ckpt))
+    if args.combine_ckpt:
+        strategies.append(("Combine",    args.combine_ckpt))
     if not strategies:
         raise ValueError("Provide at least one checkpoint flag.")
 

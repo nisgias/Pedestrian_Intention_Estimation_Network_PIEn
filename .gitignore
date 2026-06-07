@@ -1,37 +1,43 @@
-# Python
+# ─── Python ───────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
 .ipynb_checkpoints/
-.venv/
+
+# ─── Virtual environments ─────────────────────────────────
 venv/
+.venv/
+env/
 
-# Data folder: keep code + stats JSON, ignore heavy arrays/prepared data
-data/*
-!data/
-!data/**/*.py
-!data/**/*.json
-
-*.npz
-*.npy
-
-# Checkpoints / model weights
-checkpoints*/
+# ─── Model weights & checkpoints (share via Releases, not git) ───
+checkpoints/
+checkpoints_transfer/
+checkpoints_v4_targeted_l2_seed42/
 *.pth
-*.pt
 *.ckpt
+*.pt                      # e.g. yolov8n-pose.pt — downloaded on first run
 
-# Logs
-*.log
-nohup.out
-
-# Caches / generated visual outputs
+# ─── Preprocessed data & caches (regenerate with preprocess/) ───
+*.npz
 m2f_cache*/
-manydepth/
-raft_cache*/
-visualizations/
-runs/
-outputs/
+PIE_PREP_OUT/
+JAAD_PREP_OUT/
+/data/PIE/
+/data/JAAD/
 
-# OS / editor
+# ─── External dependency (add as submodule / install separately) ───
+manydepth/
+
+# ─── Dev archive (rescue thesis-relevant files first, then keep out) ───
+experiments_archive/
+
+# ─── Logs ─────────────────────────────────────────────────
+*.log
+training_log.csv
+
+# ─── OS / IDE ─────────────────────────────────────────────
 .DS_Store
+Thumbs.db
 .vscode/
+.idea/
+*.swp

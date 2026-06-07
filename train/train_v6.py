@@ -1,19 +1,21 @@
-# train_v5_transfer_focal_branchlr.py
+# train_v6.py
 """
 Two-stage Transfer Learning: JAAD pretrain -> PIE fine-tune
 Includes PIE-only baseline for direct comparison.
 
-V5 + training-dynamics update:
-  - Uses PIPNetAlphaV5Final (Spatial-Patch Transformer global branch).
-  - Adds optional Focal Loss for the main and auxiliary binary heads.
-  - Adds branch-specific AdamW learning rates:
-        * kinematic + local CNN/GRU branches: base stage LR
-        * global Transformer branch: base stage LR * --transformer_lr_mult
-        * attention/fusion/aux/final heads: base stage LR * --fusion_lr_mult
-  - Adds Transformer-specific WD multiplier:
-        global Transformer WD = --visual_l2 * --transformer_wd_mult
-  - Adds gradient clipping via --grad_clip_norm.
-  - Uses modern torch.amp autocast / GradScaler syntax when available.
+V6 update (factorized space-time global branch):
+  - Uses PIPNetAlphaV6Final:
+        * Spatial Transformer per-frame + funnel pooling (64 -> 16 patches)
+        * Enriched pedestrian token (pose center + bbox geometry)
+        * GRU temporal encoder (replaces in-Transformer temporal attention)
+        * Trajectory auxiliary decoder (predicts bbox displacement from frame 0)
+  - MultiTaskLossV6 adds an L2/Smooth-L1 trajectory regression term
+    (controlled by --traj_weight).
+  - build_branch_lr_optimizer_v6 splits the global branch:
+        * spatial Transformer + stem  -> transformer LR
+        * temporal GRU + traj decoder  -> cnn_gru LR (more stable)
+  - New CLI flags: --global_funnel_grid, --global_gru_dropout, --traj_weight.
+  - --global_n_layers is removed (V6 uses a fixed 2 spatial blocks).
 
 Checkpoint selection remains clean:
   - Best epoch is selected by validation AUC.
@@ -35,10 +37,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score
+from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score, average_precision_score
 
 from data.pie import PIESeqDataset
-from experiments_archive.old_models.pipnet_alpha_v5_final import PIPNetAlphaV5Final
+from models.pipnet_alpha_v6_final import PIPNetAlphaV6Final
+
 
 # Backward-compatible fallback for older PyTorch versions.
 try:
@@ -117,11 +120,19 @@ class FocalLoss(nn.Module):
         return focal_loss.mean()
 
 
-class MultiTaskLoss(nn.Module):
+class MultiTaskLossV6(nn.Module):
+    """
+    V6 multi-task loss.
+
+    Adds a trajectory regression term (Smooth-L1) on `aux_trajectory`
+    versus the bbox displacement from frame 0. Controlled by traj_weight;
+    set to 0 to disable (recovers the V5 behaviour).
+    """
     def __init__(
         self,
         aux_weight: float = 0.1,
         entropy_weight: float = 0.05,
+        traj_weight: float = 0.05,
         pos_weight: float = 1.0,
         loss_type: str = "focal",
         focal_alpha: float = 0.25,
@@ -130,6 +141,7 @@ class MultiTaskLoss(nn.Module):
         super().__init__()
         self.aux_weight = aux_weight
         self.entropy_weight = entropy_weight
+        self.traj_weight = traj_weight
         self.loss_type = loss_type.lower()
 
         if self.loss_type == "focal":
@@ -152,7 +164,7 @@ class MultiTaskLoss(nn.Module):
         self.bce.pos_weight = self.bce.pos_weight.to(device)
         return self.bce(logits, labels)
 
-    def forward(self, outputs: dict, labels: torch.Tensor):
+    def forward(self, outputs: dict, labels: torch.Tensor, traj_target: torch.Tensor = None):
         device = labels.device
         labels = labels.float()
         losses = {}
@@ -175,6 +187,19 @@ class MultiTaskLoss(nn.Module):
             aux_loss = torch.tensor(0.0, device=device)
             losses["aux"] = aux_loss
 
+        # ── NEW V6: Trajectory regression loss ────────────────────────────
+        if (self.traj_weight > 0
+                and "aux_trajectory" in outputs
+                and traj_target is not None):
+            traj_pred = outputs["aux_trajectory"]
+            traj_loss_raw = F.smooth_l1_loss(traj_pred, traj_target)
+            traj_loss = self.traj_weight * traj_loss_raw
+            losses["traj"] = traj_loss
+            losses["traj_raw"] = traj_loss_raw.item()
+        else:
+            traj_loss = torch.tensor(0.0, device=device)
+            losses["traj"] = traj_loss
+
         # ── Entropy regularisation on both attention distributions ────────
         entropy_loss = torch.tensor(0.0, device=device)
 
@@ -191,7 +216,7 @@ class MultiTaskLoss(nn.Module):
             losses["entropy_modality_raw"] = ent.item()
             losses["entropy_modality_norm"] = ent_norm.item()
 
-        # (b) T-token visual fusion attention  (T=10 for V5)
+        # (b) T-token visual fusion attention  (T=10 for V6)
         if "visual_fuse_weights" in outputs:
             w2 = outputs["visual_fuse_weights"]                   # (B, T)
             ent2 = -(w2 * torch.log(w2 + 1e-8)).sum(dim=-1).mean()
@@ -205,7 +230,7 @@ class MultiTaskLoss(nn.Module):
             losses["entropy_visual_fuse_norm"] = ent2_norm.item()
 
         losses["entropy"] = entropy_loss
-        losses["total"] = main_loss + aux_loss + entropy_loss
+        losses["total"] = main_loss + aux_loss + traj_loss + entropy_loss
         return losses
 
 
@@ -233,24 +258,25 @@ def count_parameters(model):
 
 def make_model(args, device):
     """Single factory — all stages use the same config."""
-    return PIPNetAlphaV5Final(
+    return PIPNetAlphaV6Final(
         dropout_p=args.dropout_p,
         local_dropout_p=args.local_dropout_p,
-        # Transformer hyper-parameters
         global_patch_grid=args.global_patch_grid,
+        global_funnel_grid=args.global_funnel_grid,
         global_d_model=args.global_d_model,
         global_n_heads=args.global_n_heads,
-        global_n_layers=args.global_n_layers,
         global_ff_dim=args.global_ff_dim,
         global_tf_dropout=args.global_tf_dropout,
         global_stem_dropout=args.global_stem_dropout,
+        global_gru_dropout=args.global_gru_dropout,
     ).to(device)
 
 
-def make_criterion(args, pos_weight: float) -> MultiTaskLoss:
-    return MultiTaskLoss(
+def make_criterion(args, pos_weight: float) -> MultiTaskLossV6:
+    return MultiTaskLossV6(
         aux_weight=args.aux_weight,
         entropy_weight=args.entropy_weight,
+        traj_weight=args.traj_weight,
         pos_weight=pos_weight,
         loss_type=args.loss_type,
         focal_alpha=args.focal_alpha,
@@ -292,12 +318,20 @@ def safe_auc(labels, probs):
         pass
     return float("nan")
 
+def safe_pr_auc(labels, probs):
+    try:
+        if len(np.unique(labels)) > 1:
+            return average_precision_score(labels, probs)
+    except Exception:
+        pass
+    return float("nan")
 
 @torch.no_grad()
 def compute_metrics(labels_np, probs_np):
     preds_bin = (probs_np >= 0.5).astype(np.int32)
     return {
         "auc": safe_auc(labels_np, probs_np),
+        "pr_auc": safe_pr_auc(labels_np, probs_np),  # <-- NEW
         "acc": float((preds_bin == labels_np).mean()),
         "f1": f1_score(labels_np, preds_bin, zero_division=0),
         "precision": precision_score(labels_np, preds_bin, zero_division=0),
@@ -317,6 +351,12 @@ def _move_batch(batch, device):
     return batch
 
 
+def _traj_target_from_batch(batch):
+    """V6: trajectory target = bbox displacement from frame 0 -> (B, T, 4)."""
+    bbox = batch["bbox"]
+    return bbox - bbox[:, 0:1, :]
+
+
 def run_train_epoch(model, loader, device, criterion, optimizer,
                     use_amp=False, scaler=None, grad_clip_norm=5.0):
     model.train()
@@ -324,6 +364,7 @@ def run_train_epoch(model, loader, device, criterion, optimizer,
     all_labels, all_probs = [], []
     all_probs_kin, all_probs_local, all_probs_global, all_probs_visual = [], [], [], []
     running_loss = running_aux_kin = running_aux_local = running_aux_global = 0.0
+    running_traj = 0.0
     total = 0
     modality_weights_sum = torch.zeros(2)
     weight_count = 0
@@ -333,11 +374,12 @@ def run_train_epoch(model, loader, device, criterion, optimizer,
     for batch in pbar:
         batch = _move_batch(batch, device)
         labels = batch["label"].float()
+        traj_target = _traj_target_from_batch(batch)
         optimizer.zero_grad(set_to_none=True)
 
         with amp_autocast(device, enabled=use_amp):
             outputs = model(batch, return_aux=True)
-            losses = criterion(outputs, labels)
+            losses = criterion(outputs, labels, traj_target=traj_target)
 
         total_loss = losses["total"]
 
@@ -366,6 +408,8 @@ def run_train_epoch(model, loader, device, criterion, optimizer,
             running_aux_kin += losses["aux_kin_loss"] * bs
             running_aux_local += losses["aux_local_loss"] * bs
             running_aux_global += losses["aux_global_loss"] * bs
+        if "traj_raw" in losses:
+            running_traj += losses["traj_raw"] * bs
 
         probs = torch.sigmoid(outputs["logit"].squeeze(-1)).detach()
         all_labels.append(labels.detach().cpu().numpy())
@@ -407,6 +451,9 @@ def run_train_epoch(model, loader, device, criterion, optimizer,
         metrics["loss_local"] = running_aux_local / max(total, 1)
         metrics["loss_global"] = running_aux_global / max(total, 1)
 
+    if running_traj > 0:
+        metrics["traj_raw"] = running_traj / max(total, 1)
+
     if all_probs_visual:
         metrics["auc_visual"] = safe_auc(labels_np, np.concatenate(all_probs_visual))
 
@@ -428,6 +475,7 @@ def run_eval_epoch(model, loader, device, criterion, use_amp=False):
     all_labels, all_probs = [], []
     all_probs_kin, all_probs_local, all_probs_global, all_probs_visual = [], [], [], []
     running_loss = running_aux_kin = running_aux_local = running_aux_global = 0.0
+    running_traj = 0.0
     total = 0
     modality_weights_sum = torch.zeros(2)
     weight_count = 0
@@ -436,10 +484,11 @@ def run_eval_epoch(model, loader, device, criterion, use_amp=False):
     for batch in tqdm(loader, desc="Eval "):
         batch = _move_batch(batch, device)
         labels = batch["label"].float()
+        traj_target = _traj_target_from_batch(batch)
 
         with amp_autocast(device, enabled=use_amp):
             outputs = model(batch, return_aux=True)
-            losses = criterion(outputs, labels)
+            losses = criterion(outputs, labels, traj_target=traj_target)
 
         bs = labels.size(0)
         running_loss += losses["total"].item() * bs
@@ -449,6 +498,8 @@ def run_eval_epoch(model, loader, device, criterion, use_amp=False):
             running_aux_kin += losses["aux_kin_loss"] * bs
             running_aux_local += losses["aux_local_loss"] * bs
             running_aux_global += losses["aux_global_loss"] * bs
+        if "traj_raw" in losses:
+            running_traj += losses["traj_raw"] * bs
 
         probs = torch.sigmoid(outputs["logit"].squeeze(-1))
         all_labels.append(labels.cpu().numpy())
@@ -486,6 +537,9 @@ def run_eval_epoch(model, loader, device, criterion, use_amp=False):
         metrics["loss_local"] = running_aux_local / max(total, 1)
         metrics["loss_global"] = running_aux_global / max(total, 1)
 
+    if running_traj > 0:
+        metrics["traj_raw"] = running_traj / max(total, 1)
+
     if all_probs_visual:
         metrics["auc_visual"] = safe_auc(labels_np, np.concatenate(all_probs_visual))
 
@@ -504,6 +558,7 @@ def print_metrics(metrics, prefix=""):
     print(
         f"{prefix} | loss: {metrics['loss']:.4f} | "
         f"auc: {metrics['auc']:.3f} | "
+        f"pr_auc: {metrics.get('pr_auc', float('nan')):.3f} | "
         f"f1: {metrics['f1']:.3f} | "
         f"acc: {metrics['acc']:.3f}"
     )
@@ -512,9 +567,11 @@ def print_metrics(metrics, prefix=""):
             f"{prefix} | Branch AUC: "
             f"kin={metrics['auc_kin']:.3f}  "
             f"local={metrics['auc_local']:.3f}  "
-            f"global(transformer)={metrics['auc_global']:.3f}  "
+            f"global(factorized)={metrics['auc_global']:.3f}  "
             f"visual={metrics.get('auc_visual', float('nan')):.3f}"
         )
+    if "traj_raw" in metrics:
+        print(f"{prefix} | Trajectory Smooth-L1: {metrics['traj_raw']:.4f}")
     if "w_visual" in metrics:
         print(
             f"{prefix} | Final Attn: "
@@ -531,9 +588,9 @@ def print_metrics(metrics, prefix=""):
 
 CSV_COLUMNS = [
     "stage", "epoch", "split",
-    "loss", "auc", "f1", "acc", "precision", "recall",
+    "loss", "auc", "pr_auc", "f1", "acc", "precision", "recall",
     "auc_kin", "auc_local", "auc_global", "auc_visual",
-    "loss_kin", "loss_local", "loss_global",
+    "loss_kin", "loss_local", "loss_global", "traj_raw",
     "w_visual", "w_kin", "visual_fuse_tokens",
     "total_params", "trainable_params",
     # dataset paths
@@ -548,17 +605,17 @@ CSV_COLUMNS = [
     "baseline_epochs", "baseline_lr",
     # loss / regularisation
     "loss_type", "focal_alpha", "focal_gamma",
-    "aux_weight", "entropy_weight", "last_fc_l2", "visual_l2",
+    "aux_weight", "entropy_weight", "traj_weight", "last_fc_l2", "visual_l2",
     # optimizer dynamics
     "optimizer_mode", "cnn_gru_lr_mult", "transformer_lr_mult", "fusion_lr_mult",
     "transformer_wd_mult", "grad_clip_norm",
     # dropout
     "dropout_p", "local_dropout_p",
-    # V5 transformer hyper-parameters
-    "global_patch_grid", "global_d_model", "global_n_heads",
-    "global_n_layers", "global_ff_dim", "global_tf_dropout", "global_stem_dropout",
+    # V6 global-branch hyper-parameters
+    "global_patch_grid", "global_funnel_grid", "global_d_model", "global_n_heads",
+    "global_ff_dim", "global_tf_dropout", "global_stem_dropout", "global_gru_dropout",
     # misc
-    "early_stopping_patience", "amp", "seed", "save_dir", "command",
+    "early_stopping_patience", "select_metric", "amp", "seed", "save_dir", "command",
     "lr", "lr_group_0", "lr_group_1", "lr_group_2", "timestamp",
 ]
 
@@ -582,6 +639,7 @@ def log_csv(path, stage, epoch, split, metrics, args,
         stage, epoch, split,
         fmt(metrics.get("loss", 0)),
         fmt(metrics.get("auc", 0)),
+        fmt(metrics.get("pr_auc", 0)),     # <-- NEW
         fmt(metrics.get("f1", 0)),
         fmt(metrics.get("acc", 0)),
         fmt(metrics.get("precision", 0)),
@@ -593,6 +651,7 @@ def log_csv(path, stage, epoch, split, metrics, args,
         fmt(metrics["loss_kin"]) if "loss_kin" in metrics else "",
         fmt(metrics["loss_local"]) if "loss_local" in metrics else "",
         fmt(metrics["loss_global"]) if "loss_global" in metrics else "",
+        fmt(metrics["traj_raw"]) if "traj_raw" in metrics else "",
         fmt(metrics["w_visual"]) if "w_visual" in metrics else "",
         fmt(metrics["w_kin"]) if "w_kin" in metrics else "",
         metrics.get("visual_fuse_tokens", ""),
@@ -607,18 +666,19 @@ def log_csv(path, stage, epoch, split, metrics, args,
         args.baseline_epochs, args.baseline_lr,
         # loss / reg
         args.loss_type, args.focal_alpha, args.focal_gamma,
-        args.aux_weight, args.entropy_weight, args.last_fc_l2, args.visual_l2,
+        args.aux_weight, args.entropy_weight, args.traj_weight,
+        args.last_fc_l2, args.visual_l2,
         # optimizer dynamics
         args.optimizer_mode, args.cnn_gru_lr_mult, args.transformer_lr_mult,
         args.fusion_lr_mult, args.transformer_wd_mult, args.grad_clip_norm,
         # dropout
         args.dropout_p, args.local_dropout_p,
-        # V5 transformer
-        args.global_patch_grid, args.global_d_model, args.global_n_heads,
-        args.global_n_layers, args.global_ff_dim,
-        args.global_tf_dropout, args.global_stem_dropout,
+        # V6 global branch
+        args.global_patch_grid, args.global_funnel_grid, args.global_d_model,
+        args.global_n_heads, args.global_ff_dim,
+        args.global_tf_dropout, args.global_stem_dropout, args.global_gru_dropout,
         # misc
-        args.early_stopping_patience, args.amp, args.seed, args.save_dir,
+        args.early_stopping_patience, args.select_metric, args.amp, args.seed, args.save_dir,
         getattr(args, "command", ""),
         f"{lr:.2e}" if lr is not None else "",
         f"{group_lrs[0]:.2e}" if isinstance(group_lrs[0], float) else group_lrs[0],
@@ -656,7 +716,12 @@ def run_training_stage(
         print(f"    {name:<30s}: {n:>10,}")
     print("=" * 80)
 
-    best_val_auc = -1.0
+    # Which validation metric drives checkpoint selection + LR scheduling.
+    # Both AUC and F1 are "higher is better", so ReduceLROnPlateau(mode="max")
+    # is correct either way. NOTE: F1 depends on the 0.5 threshold, so it can
+    # be noisier epoch-to-epoch than (threshold-free) AUC.
+    select_metric = getattr(args, "select_metric", "f1")
+    best_val_score = -1.0
     best_state = None
     patience_counter = 0
 
@@ -682,19 +747,22 @@ def run_training_stage(
                 total_params, trainable_params, lr=current_lr, group_lrs=group_lrs)
 
         if scheduler is not None:
-            scheduler.step(val_m["auc"])
+            scheduler.step(val_m[select_metric])
 
-        if val_m["auc"] > best_val_auc:
-            best_val_auc = val_m["auc"]
+        if val_m[select_metric] > best_val_score:
+            best_val_score = val_m[select_metric]
             best_state = {
                 "epoch": epoch,
                 "stage": stage_name,
+                "select_metric": select_metric,
                 "model": copy.deepcopy(model.state_dict()),
                 "optimizer": copy.deepcopy(optimizer.state_dict()),
                 "val_metrics": val_m,
             }
             torch.save(best_state, os.path.join(save_dir, "best_model.pth"))
-            print(f"  * New best model (Val AUC: {best_val_auc:.4f})")
+            print(f"  * New best model (Val {select_metric.upper()}: "
+                  f"{best_val_score:.4f} | Val AUC: {val_m['auc']:.4f} | "
+                  f"Val F1: {val_m['f1']:.4f})")
             patience_counter = 0
         else:
             patience_counter += 1
@@ -738,18 +806,29 @@ def _params_by_prefix(model: nn.Module, prefixes):
 
 def build_branch_lr_optimizer(model, lr, last_fc_l2, visual_l2, args):
     """
-    Branch-specific AdamW:
+    V6 branch-specific AdamW.
+
+    Param groups:
       cnn_gru_params      — kinematic + local CNN/GRU branch
-      transformer_params  — global spatial-patch Transformer branch
-      fusion_params       — attention, norms, aux heads, final classifier, leftovers
+                            + global temporal GRU + global trajectory decoder
+      transformer_params  — global spatial Transformer blocks + stem +
+                            positional encodings + ped/pose/bbox projections
+                            + sem/depth downsamplers
+      fusion_params       — attention, norms, aux heads, final classifier
     """
+    # GRU + trajectory decoder live inside global_branch but train like the
+    # GRU/MLP family, so they go in the cnn_gru group.
     cnn_gru_params, cnn_ids = _params_by_prefix(model, [
-        "kinematic_branch", "local_branch",
+        "kinematic_branch",
+        "local_branch",
+        "global_branch.temporal_gru",
+        "global_branch.traj_decoder",
     ])
 
-    transformer_params, transformer_ids = _params_by_prefix(model, [
-        "global_branch",
-    ])
+    # Everything else inside global_branch is the spatial Transformer stack.
+    transformer_params, _ = _params_by_prefix(model, ["global_branch"])
+    transformer_params = [p for p in transformer_params if id(p) not in cnn_ids]
+    transformer_ids = {id(p) for p in transformer_params}
 
     fusion_prefixes = [
         "kin_attn", "local_attn", "global_attn", "visual_fuse_attn", "final_attn",
@@ -759,7 +838,8 @@ def build_branch_lr_optimizer(model, lr, last_fc_l2, visual_l2, args):
     fusion_params, fusion_ids = _params_by_prefix(model, fusion_prefixes)
 
     assigned = cnn_ids | transformer_ids | fusion_ids
-    leftovers = [p for _, p in model.named_parameters() if p.requires_grad and id(p) not in assigned]
+    leftovers = [p for _, p in model.named_parameters()
+                 if p.requires_grad and id(p) not in assigned]
     fusion_params.extend(leftovers)
 
     cnn_lr = lr * args.cnn_gru_lr_mult
@@ -767,12 +847,16 @@ def build_branch_lr_optimizer(model, lr, last_fc_l2, visual_l2, args):
     fusion_lr = lr * args.fusion_lr_mult
     tf_wd = visual_l2 * args.transformer_wd_mult
 
-    print("\nOptimizer parameter groups: branch-specific AdamW")
-    print(f"  cnn_gru       lr={cnn_lr:.2e}  wd={visual_l2}: {sum(p.numel() for p in cnn_gru_params):>10,}")
-    print(f"  transformer   lr={tf_lr:.2e}  wd={tf_wd}: {sum(p.numel() for p in transformer_params):>10,}")
-    print(f"  fusion/heads  lr={fusion_lr:.2e}  wd={last_fc_l2}: {sum(p.numel() for p in fusion_params):>8,}")
+    print("\nOptimizer parameter groups: V6 branch-specific AdamW")
+    print(f"  cnn_gru (+ temporal_gru + traj_decoder) lr={cnn_lr:.2e}  wd={visual_l2}: "
+          f"{sum(p.numel() for p in cnn_gru_params):>10,}")
+    print(f"  transformer (spatial blocks + stem)     lr={tf_lr:.2e}  wd={tf_wd}: "
+          f"{sum(p.numel() for p in transformer_params):>10,}")
+    print(f"  fusion/heads                            lr={fusion_lr:.2e}  wd={last_fc_l2}: "
+          f"{sum(p.numel() for p in fusion_params):>8,}")
     if leftovers:
-        print(f"  note: {sum(p.numel() for p in leftovers):,} unclassified parameter(s) were added to fusion/heads")
+        print(f"  note: {sum(p.numel() for p in leftovers):,} unclassified "
+              f"parameter(s) were added to fusion/heads")
 
     optimizer = torch.optim.AdamW(
         [
@@ -786,7 +870,7 @@ def build_branch_lr_optimizer(model, lr, last_fc_l2, visual_l2, args):
 
 def build_targeted_optimizer(model, lr, last_fc_l2, visual_l2):
     """
-    Original V4/V5 targeted AdamW weight decay:
+    Original targeted AdamW weight decay:
       base_params       — kinematic + kin_attn + final_attn: no decay
       visual_params     — local/global branches + visual fusion: visual_l2
       final_fc_params   — fc_out: last_fc_l2
@@ -854,7 +938,8 @@ def set_seed(seed: int):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PIPNet-Alpha V5 — Transformer Global Branch Training + Focal Loss + Branch LR"
+        description="PIPNet-Alpha V6 — Factorized Space-Time Global Branch "
+                    "+ Focal Loss + Branch LR + Trajectory Aux"
     )
 
     # ── Data ────────────────────────────────────────────────────────────────
@@ -881,21 +966,25 @@ def main():
     parser.add_argument("--local_dropout_p", type=float, default=0.3,
                         help="LocalVisualBranch inter-GRU dropout")
 
-    # ── V5: Transformer hyper-parameters ────────────────────────────────────
+    # ── V6: global-branch hyper-parameters ───────────────────────────────────
     parser.add_argument("--global_patch_grid", type=int, default=8,
-                        help="Patch grid side P (P×P tokens per frame). target_size must be divisible by P.")
+                        help="Patch grid side P (P×P tokens/frame before funnel). "
+                             "target_size must be divisible by P.")
+    parser.add_argument("--global_funnel_grid", type=int, default=4,
+                        help="Patch grid side after funnel pooling "
+                             "(4 → 16 tokens). Must divide patch_grid.")
     parser.add_argument("--global_d_model", type=int, default=128,
-                        help="Transformer token dimension")
+                        help="Transformer token dimension (must be even)")
     parser.add_argument("--global_n_heads", type=int, default=4,
                         help="Number of self-attention heads (d_model % n_heads == 0)")
-    parser.add_argument("--global_n_layers", type=int, default=2,
-                        help="Number of TransformerEncoderLayer blocks")
     parser.add_argument("--global_ff_dim", type=int, default=256,
                         help="Feedforward inner dimension")
     parser.add_argument("--global_tf_dropout", type=float, default=0.1,
                         help="Transformer internal dropout (attention + ff)")
     parser.add_argument("--global_stem_dropout", type=float, default=0.1,
                         help="Dropout after CNN stem projection")
+    parser.add_argument("--global_gru_dropout", type=float, default=0.1,
+                        help="Dropout after the temporal GRU")
 
     # ── JAAD stage ───────────────────────────────────────────────────────────
     parser.add_argument("--jaad_epochs", type=int, default=80)
@@ -920,37 +1009,52 @@ def main():
                         help="Focusing gamma for focal loss.")
     parser.add_argument("--aux_weight", type=float, default=0.1)
     parser.add_argument("--entropy_weight", type=float, default=0.05)
+    parser.add_argument("--traj_weight", type=float, default=0.05,
+                        help="Weight on the V6 trajectory Smooth-L1 aux loss. "
+                             "Set to 0 to disable.")
     parser.add_argument("--last_fc_l2", type=float, default=1e-4,
                         help="AdamW weight decay on fc_out / fusion heads")
     parser.add_argument("--visual_l2", type=float, default=0.0,
                         help="AdamW weight decay on visual / global params")
     parser.add_argument("--wpos", type=float, default=-1.0,
-                        help="Manual pos_weight for BCEWithLogitsLoss (-1 = auto). Ignored by focal loss.")
+                        help="Manual pos_weight for BCEWithLogitsLoss (-1 = auto). "
+                             "Ignored by focal loss.")
 
     # ── Optimizer dynamics ───────────────────────────────────────────────────
     parser.add_argument("--optimizer_mode", choices=["branch_lr", "targeted"], default="branch_lr",
-                        help="branch_lr = different LR per branch; targeted = old V4/V5 AdamW grouping.")
+                        help="branch_lr = different LR per branch; targeted = old AdamW grouping.")
     parser.add_argument("--cnn_gru_lr_mult", type=float, default=1.0,
-                        help="LR multiplier for kinematic + local CNN/GRU branches.")
-    parser.add_argument("--transformer_lr_mult", type=float, default=2.5,
-                        help="LR multiplier for the global Transformer branch.")
+                        help="LR multiplier for kinematic + local CNN/GRU + "
+                             "global temporal GRU + traj decoder.")
+    parser.add_argument("--transformer_lr_mult", type=float, default=1.5,
+                        help="LR multiplier for the global spatial Transformer. "
+                             "V6 is more stable than V5, so 1.5 is a good start "
+                             "(V5 used 2.5).")
     parser.add_argument("--fusion_lr_mult", type=float, default=1.0,
                         help="LR multiplier for attention/fusion/aux/final heads.")
-    parser.add_argument("--transformer_wd_mult", type=float, default=5.0,
-                        help="Multiplier over visual_l2 for Transformer branch weight decay.")
+    parser.add_argument("--transformer_wd_mult", type=float, default=3.0,
+                        help="Multiplier over visual_l2 for Transformer weight decay "
+                             "(V5 used 5.0).")
     parser.add_argument("--grad_clip_norm", type=float, default=5.0,
                         help="Max grad-norm clipping. Use 0 to disable.")
 
     # ── Scheduler ────────────────────────────────────────────────────────────
     parser.add_argument("--fixed_lr", action="store_true")
     parser.add_argument("--early_stopping_patience", type=int, default=10)
+    parser.add_argument("--select_metric", choices=["auc", "pr_auc", "f1"], default="f1",
+                        help="Validation metric used for best-checkpoint "
+                             "selection, LR scheduling, and early stopping. "
+                             "All are logged regardless. pr_auc (average "
+                             "precision) is threshold-free and sensitive to "
+                             "the minority class — best for imbalanced data. "
+                             "f1 uses a 0.5 threshold so it can be noisier.")
 
     # ── Runtime ──────────────────────────────────────────────────────────────
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--save_dir", type=str, default="checkpoints_v5_transfer_focal_branchlr")
+    parser.add_argument("--save_dir", type=str, default="checkpoints_v6")
 
     args = parser.parse_args()
     args.command = " ".join(sys.argv)
@@ -967,26 +1071,29 @@ def main():
     init_csv(csv_path)
 
     print("=" * 80)
-    print("PIPNet-Alpha V5 — Spatial-Patch Transformer Global Branch")
-    print("Focal Loss + Branch-Specific Learning Rates")
+    print("PIPNet-Alpha V6 — Factorized Space-Time Global Branch")
+    print("Focal Loss + Branch-Specific LR + Trajectory Auxiliary Head")
     print("=" * 80)
-    print(f"  Device:         {device}")
-    print(f"  AMP:            {use_amp}")
-    print(f"  Seed:           {args.seed}")
-    print(f"  Loss:           {args.loss_type}")
+    print(f"  Device:          {device}")
+    print(f"  AMP:             {use_amp}")
+    print(f"  Seed:            {args.seed}")
+    print(f"  Loss:            {args.loss_type}")
     if args.loss_type == "focal":
         print(f"  Focal alpha/gamma: {args.focal_alpha} / {args.focal_gamma}")
-    print(f"  Optimizer mode: {args.optimizer_mode}")
-    print(f"  LR multipliers: cnn_gru={args.cnn_gru_lr_mult}, "
+    print(f"  Traj weight:     {args.traj_weight}")
+    print(f"  Select metric:   {args.select_metric}  (best checkpoint / early stop)")
+    print(f"  Optimizer mode:  {args.optimizer_mode}")
+    print(f"  LR multipliers:  cnn_gru={args.cnn_gru_lr_mult}, "
           f"transformer={args.transformer_lr_mult}, fusion={args.fusion_lr_mult}")
-    print(f"  Grad clip norm: {args.grad_clip_norm}")
-    print(f"  Patch grid:     {args.global_patch_grid}×{args.global_patch_grid} "
-          f"= {args.global_patch_grid ** 2} tokens/frame")
-    print(f"  d_model:        {args.global_d_model}")
-    print(f"  n_heads/layers: {args.global_n_heads} / {args.global_n_layers}")
-    print(f"  ff_dim:         {args.global_ff_dim}")
-    print(f"  tf_dropout:     {args.global_tf_dropout}")
-    print(f"  stem_dropout:   {args.global_stem_dropout}")
+    print(f"  Grad clip norm:  {args.grad_clip_norm}")
+    print(f"  Patch grid:      {args.global_patch_grid}×{args.global_patch_grid} "
+          f"→ funnel {args.global_funnel_grid}×{args.global_funnel_grid}")
+    print(f"  d_model:         {args.global_d_model}")
+    print(f"  n_heads:         {args.global_n_heads}")
+    print(f"  ff_dim:          {args.global_ff_dim}")
+    print(f"  tf_dropout:      {args.global_tf_dropout}")
+    print(f"  stem_dropout:    {args.global_stem_dropout}")
+    print(f"  gru_dropout:     {args.global_gru_dropout}")
     print("=" * 80)
 
     jaad_ckpt = None
@@ -1008,7 +1115,8 @@ def main():
                 args.wpos if args.wpos > 0
                 else compute_pos_weight_from_npz(jaad_train_ds.files)[0]
             )
-            print(f"\n[S1] JAAD pos_weight = {jaad_wpos:.3f} ({'ignored by focal loss' if args.loss_type == 'focal' else 'BCE'})")
+            print(f"\n[S1] JAAD pos_weight = {jaad_wpos:.3f} "
+                  f"({'ignored by focal loss' if args.loss_type == 'focal' else 'BCE'})")
 
             model_s1 = make_model(args, device)
             criterion_s1 = make_criterion(args, jaad_wpos)
@@ -1035,7 +1143,8 @@ def main():
             args.wpos if args.wpos > 0
             else compute_pos_weight_from_npz(pie_train_ds.files)[0]
         )
-        print(f"\n[S2] PIE pos_weight = {pie_wpos:.3f} ({'ignored by focal loss' if args.loss_type == 'focal' else 'BCE'})")
+        print(f"\n[S2] PIE pos_weight = {pie_wpos:.3f} "
+              f"({'ignored by focal loss' if args.loss_type == 'focal' else 'BCE'})")
 
         model_s2 = make_model(args, device)
         model_s2.load_state_dict(jaad_ckpt["model"])
@@ -1066,7 +1175,8 @@ def main():
     # ─────────────────────────────────────────────────────────── S3
     if not args.skip_baseline:
         stage3_dir = os.path.join(args.save_dir, "stage3_pie_baseline")
-        print(f"\n[S3] PIE-only baseline — pos_weight = {pie_wpos:.3f} ({'ignored by focal loss' if args.loss_type == 'focal' else 'BCE'})")
+        print(f"\n[S3] PIE-only baseline — pos_weight = {pie_wpos:.3f} "
+              f"({'ignored by focal loss' if args.loss_type == 'focal' else 'BCE'})")
 
         model_s3 = make_model(args, device)
         criterion_s3 = make_criterion(args, pie_wpos)

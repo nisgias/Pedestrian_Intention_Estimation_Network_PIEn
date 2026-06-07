@@ -3,7 +3,7 @@ eval_compare_strategies.py
 
 Compare multiple training strategies on the same test horizons:
     1. PIE-only baseline (S3)
-    2. Pooled JAAD+PIE training
+    2. Combine JAAD+PIE training
     3. JAAD->PIE transfer learning (S2)
 
 For each (strategy, horizon) we report:
@@ -17,7 +17,7 @@ Outputs:
 USAGE:
     python eval_compare_strategies.py \
         --pie_only_ckpt   checkpoints_v4_best_seed46/stage3_pie_baseline/best_model.pth \
-        --pooled_ckpt     checkpoints_v4_pooled_matched_trial12_seed42/.../best_model.pth \
+        --combine_ckpt     checkpoints_v4_combine_matched_trial12_seed42/.../best_model.pth \
         --transfer_ckpt   checkpoints_reproduce_transfer_trial12/stage2_pie_transfer/best_model.pth \
         --base_root /Datasets/ETCS \
         --horizons ETC0_5,ETC1,ETC2,ETC3,ETC4 \
@@ -145,8 +145,8 @@ def main():
     # The three strategies; pass empty string to skip one
     ap.add_argument("--pie_only_ckpt", type=str, default="",
                     help="PIE-only baseline (S3) checkpoint.")
-    ap.add_argument("--pooled_ckpt", type=str, default="",
-                    help="Pooled JAAD+PIE checkpoint.")
+    ap.add_argument("--combine_ckpt", type=str, default="",
+                    help="Combine JAAD+PIE checkpoint.")
     ap.add_argument("--transfer_ckpt", type=str, default="",
                     help="JAAD->PIE transfer (S2) checkpoint.")
 
@@ -176,8 +176,8 @@ def main():
         strategies.append(("PIE-only",  args.pie_only_ckpt))
     if args.transfer_ckpt:
         strategies.append(("Transfer",  args.transfer_ckpt))
-    if args.pooled_ckpt:
-        strategies.append(("Pooled",    args.pooled_ckpt))
+    if args.combine_ckpt:
+        strategies.append(("Combine",    args.combine_ckpt))
 
     if not strategies:
         raise ValueError("Provide at least one checkpoint flag.")

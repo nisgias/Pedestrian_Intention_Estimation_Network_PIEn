@@ -69,7 +69,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from data.pie import PIESeqDataset
 
-from models.pipnet_alpha_v5_final import PIPNetAlphaV5Final as PIPNetAlphaV4Final
+from experiments_archive.old_models.pipnet_alpha_v5_final import PIPNetAlphaV5Final as PIPNetAlphaV4Final
 
 
 # ============================================================
