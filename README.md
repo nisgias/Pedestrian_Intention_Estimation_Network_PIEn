@@ -16,7 +16,7 @@
 <br><br>
 
 <a href="assets/%CE%A0%CE%A1%CE%9F%CE%92%CE%9B%CE%95%CE%A8%CE%97_%CE%A0%CE%A1%CE%9F%CE%98%CE%95%CE%A3%CE%97%CE%A3.pdf">
-  <strong>📄 Read the full thesis report (PDF)</strong>
+  <strong>📄 Read the full report in GREEK (PDF)</strong>
 </a>
 
 </div>
