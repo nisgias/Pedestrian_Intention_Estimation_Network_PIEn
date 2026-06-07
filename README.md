@@ -4,14 +4,20 @@
 
 **A multimodal, multi-branch deep-learning model that predicts whether a pedestrian is about to cross the road — and how soon — from an autonomous vehicle's camera.**
 
-[![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-%E2%89%A52.0-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python\&logoColor=white)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-%E2%89%A52.0-EE4C2C?logo=pytorch\&logoColor=white)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Dataset: PIE](https://img.shields.io/badge/Dataset-PIE%20%2F%20JAAD-blue)](https://data.nvision2.eecs.yorku.ca/PIE_dataset/)
 
 <img src="assets/demo.gif" alt="PIPN live crossing-intention demo" width="760">
 
 <em>Live inference on PIE — red = will cross (next ~1–2 s), green = no crossing intent, amber = uncertain.</em>
+
+<br><br>
+
+<a href="assets/%CE%A0%CE%A1%CE%9F%CE%92%CE%9B%CE%95%CE%A8%CE%97_%CE%A0%CE%A1%CE%9F%CE%98%CE%95%CE%A3%CE%97%CE%A3.pdf">
+  <strong>📄 Read the full thesis report (PDF)</strong>
+</a>
 
 </div>
 
@@ -23,9 +29,9 @@ Knowing **where** a pedestrian is isn't enough for a self-driving car — it nee
 
 **PIPN** tackles this as a binary forecasting problem — *will this pedestrian cross in the next 1–2 seconds?* — by fusing three complementary streams of information:
 
-- **How the pedestrian moves** (kinematics)
-- **What they look like up close** (local appearance & motion)
-- **Where they are in the scene** (global context & geometry)
+* **How the pedestrian moves** (kinematics)
+* **What they look like up close** (local appearance & motion)
+* **Where they are in the scene** (global context & geometry)
 
 This repository contains the full, reproducible pipeline — preprocessing, models, training strategies, and evaluation — developed for the diploma thesis *"Evaluation of deep-learning techniques for pedestrian intention and motion prediction from autonomous vehicles."*
 
@@ -33,11 +39,11 @@ This repository contains the full, reproducible pipeline — preprocessing, mode
 
 ## Highlights
 
-- **Three-branch architecture** with hierarchical attention-based fusion and per-branch auxiliary heads for interpretability.
-- **Modern perception stack** — VGG19 (local appearance), RAFT-large (optical flow), Mask2Former (panoptic segmentation), ManyDepth (categorical depth), YOLOv8-pose (keypoints), plus an **ego-vehicle suppression** step that cleans the scene maps.
-- **Honest, multi-horizon evaluation** across five time-to-event horizons (0.5–4 s), not a single cherry-picked number.
-- **KinFormer-GRU** — a lightweight variant that matches the full model's mean accuracy with **6.8× fewer parameters**.
-- **Reproducible by design** — fixed seeds, leakage-controlled splits, and one evaluation script per reported figure.
+* **Three-branch architecture** with hierarchical attention-based fusion and per-branch auxiliary heads for interpretability.
+* **Modern perception stack** — VGG19 (local appearance), RAFT-large (optical flow), Mask2Former (panoptic segmentation), ManyDepth (categorical depth), YOLOv8-pose (keypoints), plus an **ego-vehicle suppression** step that cleans the scene maps.
+* **Honest, multi-horizon evaluation** across five time-to-event horizons (0.5–4 s), not a single cherry-picked number.
+* **KinFormer-GRU** — a lightweight variant that matches the full model's mean accuracy with **6.8× fewer parameters**.
+* **Reproducible by design** — fixed seeds, leakage-controlled splits, and one evaluation script per reported figure.
 
 ---
 
@@ -45,12 +51,12 @@ This repository contains the full, reproducible pipeline — preprocessing, mode
 
 Primary benchmark: **PIE** test set. Headline metric: **ROC-AUC**.
 
-| Setting | ROC-AUC | Notes |
-|---|:---:|---|
-| **PIPN** — standard test (TTE ≈ 1.5 s), 5 seeds | **0.887 ± 0.011** | mean across seeds 42–46 |
-| **PIPN** — peak horizon (TTE ≈ 2.0 s) | **0.908** | within the 1–2 s design range |
-| **PIPN** — stable band (TTE 1–4 s) | **≥ 0.87** | robust temporal generalization |
-| **KinFormer-GRU** (652K params) | **0.887** | 6.8× fewer params than PIPN (4.42M) |
+| Setting                                         |      ROC-AUC      | Notes                               |
+| ----------------------------------------------- | :---------------: | ----------------------------------- |
+| **PIPN** — standard test (TTE ≈ 1.5 s), 5 seeds | **0.887 ± 0.011** | mean across seeds 42–46             |
+| **PIPN** — peak horizon (TTE ≈ 2.0 s)           |     **0.908**     | within the 1–2 s design range       |
+| **PIPN** — stable band (TTE 1–4 s)              |     **≥ 0.87**    | robust temporal generalization      |
+| **KinFormer-GRU** (652K params)                 |     **0.887**     | 6.8× fewer params than PIPN (4.42M) |
 
 > **Read with care.** At TTE ≈ 0.5 s — *outside* the model's training range — PIPN reaches 0.883, which is competitive but below some recent high-capacity architectures optimized for that horizon. The model's strength is **stability across longer horizons**, where kinematic and global-context cues complement each other. Cross-dataset transfer to JAAD is intentionally reported as **modest** (≈ 0.635 with combined training), reflecting a real domain shift rather than strong generalization.
 
@@ -64,10 +70,10 @@ PIPN uses **4.42M parameters — about 20% fewer than PIP-Net-α (≈ 5.5M)** �
   <img src="assets/architecture.png" alt="PIPN three-branch architecture" width="880">
 </div>
 
-- **Kinematic branch** — bounding box (4D) + body pose (34D) + ego-speed (1D) through three stacked GRUs and temporal attention pooling → `z_kin` (128D).
-- **Local visual branch** — per-frame **VGG19** crop features (ImageNet-1K) + RAFT optical flow through content and motion GRUs → `z_local` (128D).
-- **Global context branch** — Mask2Former semantic segmentation + ManyDepth instance-aware categorical depth through lightweight Conv3D towers and a temporal GRU → `h_global` (256D).
-- **Fusion** — a two-stage attention scheme: first **visual fusion** (`z_local` ⊕ `h_global` → attention over T frames → `z_visual`), then **modality fusion** (attention over `[z_visual, z_kin]` → dropout → FC → `P(cross)`). Three auxiliary heads supervise the branches and enable per-branch analysis.
+* **Kinematic branch** — bounding box (4D) + body pose (34D) + ego-speed (1D) through three stacked GRUs and temporal attention pooling → `z_kin` (128D).
+* **Local visual branch** — per-frame **VGG19** crop features (ImageNet-1K) + RAFT optical flow through content and motion GRUs → `z_local` (128D).
+* **Global context branch** — Mask2Former semantic segmentation + ManyDepth instance-aware categorical depth through lightweight Conv3D towers and a temporal GRU → `h_global` (256D).
+* **Fusion** — a two-stage attention scheme: first **visual fusion** (`z_local` ⊕ `h_global` → attention over T frames → `z_visual`), then **modality fusion** (attention over `[z_visual, z_kin]` → dropout → FC → `P(cross)`). Three auxiliary heads supervise the branches and enable per-branch analysis.
 
 ### KinFormer-GRU — lightweight variant
 
@@ -151,11 +157,11 @@ python -m eval.eval_roc_horizons          # ROC curves per horizon
 
 ## Training strategies
 
-| Strategy | Description | Script |
-|---|---|---|
-| **PIE-only** | Train from scratch on PIE only (main benchmark). | `train/train_v4_transfer.py --skip_transfer` |
-| **Transfer** | Pretrain on JAAD, fine-tune on PIE. Best generalization. | `train/train_v4_transfer.py` |
-| **Combine** | Joint JAAD + PIE training; tested on PIE *and* JAAD. JAAD ego-speed is zero-filled (unavailable). | `train/train_v4_combine.py` |
+| Strategy     | Description                                                                                       | Script                                       |
+| ------------ | ------------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| **PIE-only** | Train from scratch on PIE only (main benchmark).                                                  | `train/train_v4_transfer.py --skip_transfer` |
+| **Transfer** | Pretrain on JAAD, fine-tune on PIE. Best generalization.                                          | `train/train_v4_transfer.py`                 |
+| **Combine**  | Joint JAAD + PIE training; tested on PIE *and* JAAD. JAAD ego-speed is zero-filled (unavailable). | `train/train_v4_combine.py`                  |
 
 ---
 
@@ -190,17 +196,17 @@ Pedestrian_Intention_Estimation_Network_PIEn/
 
 ## Reproducing the thesis figures
 
-| Figure / Table | Script |
-|---|---|
-| Multi-horizon metrics (ROC-AUC, F1, Acc) | `eval/eval_all_horizons.py` |
-| Per-branch contribution across TTE | `eval/eval_per_branch_horizons.py`, `tools/plot_branch_horizons.py` |
-| Branch-zeroing ablations | `eval/eval_ablation_horizons.py` |
-| Seed stability, error correlation, jitter | `eval/eval_multiseed_v4.py` |
-| Post-hoc logit fusion | `eval/eval_posthoc_fusion_horizons.py` |
-| ROC curves per horizon | `eval/eval_roc_horizons.py` |
-| Cross-dataset (PIE / JAAD) | `eval/eval_compare_strategies.py`, `eval/eval_compare_strategies_jaad.py` |
-| KinFormer horizon sweep | `tools/eval_kinformer_horizons.py` |
-| Qualitative TP/TN/FP/FN grid | `tools/viz_qualitative_grid.py` |
+| Figure / Table                            | Script                                                                    |
+| ----------------------------------------- | ------------------------------------------------------------------------- |
+| Multi-horizon metrics (ROC-AUC, F1, Acc)  | `eval/eval_all_horizons.py`                                               |
+| Per-branch contribution across TTE        | `eval/eval_per_branch_horizons.py`, `tools/plot_branch_horizons.py`       |
+| Branch-zeroing ablations                  | `eval/eval_ablation_horizons.py`                                          |
+| Seed stability, error correlation, jitter | `eval/eval_multiseed_v4.py`                                               |
+| Post-hoc logit fusion                     | `eval/eval_posthoc_fusion_horizons.py`                                    |
+| ROC curves per horizon                    | `eval/eval_roc_horizons.py`                                               |
+| Cross-dataset (PIE / JAAD)                | `eval/eval_compare_strategies.py`, `eval/eval_compare_strategies_jaad.py` |
+| KinFormer horizon sweep                   | `tools/eval_kinformer_horizons.py`                                        |
+| Qualitative TP/TN/FP/FN grid              | `tools/viz_qualitative_grid.py`                                           |
 
 ---
 
