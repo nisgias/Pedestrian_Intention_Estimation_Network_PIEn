@@ -69,6 +69,14 @@ PIPN uses **4.42M parameters — about 20% fewer than PIP-Net-α (≈ 5.5M)** �
 - **Global context branch** — Mask2Former semantic segmentation + ManyDepth instance-aware categorical depth through lightweight Conv3D towers and a temporal GRU → `h_global` (256D).
 - **Fusion** — a two-stage attention scheme: first **visual fusion** (`z_local` ⊕ `h_global` → attention over T frames → `z_visual`), then **modality fusion** (attention over `[z_visual, z_kin]` → dropout → FC → `P(cross)`). Three auxiliary heads supervise the branches and enable per-branch analysis.
 
+### KinFormer-GRU — lightweight variant
+
+<div align="center">
+  <img src="assets/kinformer.png" alt="KinFormer-GRU architecture" width="880">
+</div>
+
+Instead of running a separate global branch, **KinFormer-GRU** keeps the kinematic branch as an **anchor token** and injects selected scene context (traffic-aware segmentation masks, categorical depth, local appearance, optical flow) as **gated contextual tokens** through a per-frame Transformer encoder, with the classifier reading out only from the kinematic anchor. It matches PIPN's mean ROC-AUC (≈ 0.887) with just **652K parameters — 6.8× fewer than PIPN** — a favorable performance–efficiency trade-off for resource-constrained deployment.
+
 ---
 
 ## Quickstart
